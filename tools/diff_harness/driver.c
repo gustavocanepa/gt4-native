@@ -26,7 +26,8 @@
 #ifndef RET_T
 #define RET_T int
 #endif
-extern RET_T func_UNDER_TEST(unsigned a0, unsigned a1, unsigned a2, unsigned a3);
+extern RET_T func_UNDER_TEST(unsigned a0, unsigned a1, unsigned a2, unsigned a3,
+                             unsigned a4, unsigned a5, unsigned a6, unsigned a7);
 
 static uint32_t bits_of(RET_T v)
 {
@@ -66,10 +67,10 @@ int main(int argc, char **argv)
         }
     }
     void *mem = map_at(base, size);
-    uint32_t args[4];
+    uint32_t args[8];
     uint8_t *buf = malloc(size);
     for (uint32_t t = 0; t < n; t++) {
-        if (fread(args, 4, 4, in) != 4 || fread(buf, 1, size, in) != size) return 2;
+        if (fread(args, 4, 8, in) != 8 || fread(buf, 1, size, in) != size) return 2;
         memcpy(mem, buf, size);
         int fd[2];
         if (pipe(fd)) return 2;
@@ -78,7 +79,7 @@ int main(int argc, char **argv)
         if (pid == 0) {
             close(fd[0]);
             alarm(2);
-            RET_T r = func_UNDER_TEST(args[0], args[1], args[2], args[3]);
+            RET_T r = func_UNDER_TEST(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]);
             uint32_t hdr[3] = {1, bits_of(r), 0};
             FILE *w = fdopen(fd[1], "wb");
             fwrite(hdr, 4, 3, w);

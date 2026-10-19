@@ -35,6 +35,9 @@ BASE, SIZE = 0x10000000, 0x4000          # the shared memory block
 STACK, STACK_SIZE = 0x7F000000, 0x10000
 SENTINEL = 0x7E000000
 ERRORS = {}
+NARGS = 8         # EABI: ints in a0-a3 then t0-t3, floats in f12-f19; on the host everything is on the stack in order
+BITS = 32           # host pointer width of the native side (--m64: the 64-bit identity core, guest memory mapped at its low addresses)
+ADAPT = False       # --adapt: run every compiled source through tools/u32_adapt.py (pointer members become 32-bit guest pointers)
 WORK = []        # scratch directories of the function being tested, removed before the next one
 MAX_CALLEES = 60
 HOST_LIBC = {"strlen", "strcmp", "strncmp", "strcpy", "strncpy", "strcat", "strchr", "strrchr", "strstr",
@@ -80,7 +83,7 @@ def arg_kinds(path, addr):
     text = open(path, encoding="utf-8", errors="replace").read()
     m = re.search(rf"\bfunc_{addr:08X}\s*\(([^)]*)\)", text)
     if not m:
-        return ["i"] * 4
+        return ["i"] * NARGS
     params = [p for p in m.group(1).split(",") if p.strip() and p.strip() != "void"]
 
     def used_as_address(p):
@@ -89,7 +92,7 @@ def arg_kinds(path, addr):
 
     kinds = ["p" if "*" in p or used_as_address(p) else ("f" if re.search(r"\b(f32|float)\b", p) else
                                    "c" if re.search(r"\b(char|s8|u8)\b", p) else "i") for p in params]
-    return (kinds + ["i"] * 4)[:4]
+    return (kinds + ["i"] * NARGS)[:NARGS]
 
 
 def return_kind(path, addr):
@@ -99,6 +102,9 @@ def return_kind(path, addr):
     head = (m.group(1) if m else "").replace('extern "C"', "").strip().split("\n")[-1]
     if re.search(r"\bvoid\b(?!\s*\*)", head):
         return "void", 32, "int"
+    body = text[m.end():] if m else ""
+    if "{" in body and not re.search(r"\breturn\b", body[body.index("{"):]):
+        return "void", 32, "int"      # falls off its end: the original leaves whatever was in v0
     if re.search(r"\b(f32|float)\b(?!\s*\*)", head):
         return "f32", 32, "float"
     if "*" not in head and re.search(r"\b(s16|u16|short)\b", head):
@@ -195,7 +201,7 @@ def changed_words(now, was, lo):
 def run_original(addr, kinds, ret, trials):
     from unicorn import Uc, UC_ARCH_MIPS, UC_MODE_MIPS64, UC_MODE_LITTLE_ENDIAN, UcError
     from unicorn.mips_const import (UC_CPU_MIPS64_5KF, UC_MIPS_REG_A0, UC_MIPS_REG_V0, UC_MIPS_REG_RA,
-                                    UC_MIPS_REG_SP, UC_MIPS_REG_F0, UC_MIPS_REG_F12)
+                                    UC_MIPS_REG_SP, UC_MIPS_REG_F0, UC_MIPS_REG_F12, UC_MIPS_REG_T0)
     code_addr, code = IMAGE["code"]
     lo, data = IMAGE["data_lo"], IMAGE["data"]
     results = []
@@ -216,7 +222,8 @@ def run_original(addr, kinds, ret, trials):
                 mu.reg_write(UC_MIPS_REG_F12 + floats, a)
                 floats += 1
             else:
-                mu.reg_write(UC_MIPS_REG_A0 + ints, a if a < 0x80000000 else a - (1 << 32) + (1 << 64))
+                reg = UC_MIPS_REG_A0 + ints if ints < 4 else UC_MIPS_REG_T0 + (ints - 4)
+                mu.reg_write(reg, a if a < 0x80000000 else a - (1 << 32) + (1 << 64))
                 ints += 1
         mu.reg_write(UC_MIPS_REG_SP, STACK + STACK_SIZE - 0x100)
         mu.reg_write(UC_MIPS_REG_RA, SENTINEL)
@@ -238,18 +245,28 @@ def run_original(addr, kinds, ret, trials):
 
 def compile_one(src, addr, work, tag):
     ext = os.path.splitext(src)[1]
+    decomp = os.getcwd()
+    where = work
+    orig_dir = os.path.dirname(src)
+    if ADAPT:
+        sys.path.insert(0, os.path.join(NATIVE, "tools"))
+        import u32_adapt
+        where = os.path.join(work, "ad_" + tag)
+        ad, _ = u32_adapt.adapt_file(src, where, tag, decomp)
+        if ad:
+            src, ext = ad, ".cpp"
     text = guest_long(open(src, encoding="utf-8", errors="replace").read())
     text = re.sub(r"^\s*/\*\s*compiler:[^*]*\*/", "", text, count=1)
-    srcf = os.path.join(work, f"{tag}{ext}")
+    srcf = os.path.join(where, f"{tag}{ext}")
     open(srcf, "w", encoding="utf-8").write(text)
-    decomp = os.getcwd()
     inc = ["-I", os.path.join(NATIVE, "compat", "host32"), "-I", os.path.join(decomp, "include"),
            "-I", os.path.join(decomp, "include", "shim"), "-I", os.path.join(decomp, "include", "stl"),
-           "-I", os.path.dirname(src)]
+           "-I", orig_dir]
     obj = os.path.join(work, f"{tag}.o")
     cc = "g++" if ext == ".cpp" else "gcc"
-    r = subprocess.run([cc, "-m32", "-malign-double", "-msse2", "-mfpmath=sse", "-O1", "-w", "-fpermissive",
-                        "-fno-strict-aliasing", "-c", srcf, "-o", obj] + inc, capture_output=True, text=True)
+    r = subprocess.run([cc, f"-m{BITS}", "-malign-double", "-msse2", "-mfpmath=sse", "-O1", "-w", "-fpermissive",
+                        "-fno-strict-aliasing", "-fPIC", "-c", srcf, "-o", obj] + inc, capture_output=True, text=True,
+                       timeout=180)
     if r.returncode:
         return None, "compile: " + next((l for l in r.stderr.splitlines() if "error" in l), r.stderr[:160])
     return obj, None
@@ -307,18 +324,29 @@ def build_native(addr, src, ctype="int"):
                 seen.add(target)
                 queue.append((target, callee))
     drv = os.path.join(work, "driver.o")
-    subprocess.run(["gcc", "-m32", "-malign-double", "-msse2", "-O1", "-c", os.path.join(HERE, "driver.c"), "-o", drv,
+    subprocess.run(["gcc", f"-m{BITS}", "-malign-double", "-msse2", "-O1", "-fPIC", "-c", os.path.join(HERE, "driver.c"), "-o", drv,
                     f"-Dfunc_UNDER_TEST=func_{addr:08X}", f"-DRET_T={ctype}"], check=True)
     exe = os.path.join(work, "run")
     if aliases:
         asm = os.path.join(work, "alias.s")
         with open(asm, "w") as f:
             for n, v in aliases.items():
-                f.write(f".globl {n}\n.type {n},@function\n{n}:\n\tjmp {v}\n")
-        subprocess.run(["gcc", "-m32", "-c", asm, "-o", asm[:-2] + ".o"], check=True)
+                f.write(f".globl {n}\n.type {n},@function\n{n}:\n\tjmp {v}{'@PLT' if BITS == 64 else ''}\n")
+        subprocess.run(["gcc", f"-m{BITS}", "-c", asm, "-o", asm[:-2] + ".o"], check=True)
         objs.append(asm[:-2] + ".o")
-    r = subprocess.run(["gcc", "-m32", "-no-pie", *objs, drv, "-o", exe] +
-                       [f"-Wl,--defsym,{n}={v:#x}" for n, v in defsyms.items()], capture_output=True, text=True)
+    defsym_flags = [f"-Wl,--defsym,{n}={v:#x}" for n, v in defsyms.items()]
+    if BITS == 64 and defsyms:
+        # ld --defsym symbols get the load bias added in a PIE (their GOT entries are relocated); symbols defined by the
+        # assembler (.set) stay absolute, which is what a guest address is
+        asm = os.path.join(work, "abs.s")
+        with open(asm, "w") as f:
+            for n, v in defsyms.items():
+                f.write(f".weak {n}\n.set {n}, {v:#x}\n")
+        subprocess.run(["gcc", "-m64", "-c", asm, "-o", asm[:-2] + ".o"], check=True)
+        objs.append(asm[:-2] + ".o")
+        defsym_flags = []
+    r = subprocess.run(["gcc", f"-m{BITS}", "-no-pie" if BITS == 32 else "-pie", *objs, drv, "-o", exe] + defsym_flags,
+                       capture_output=True, text=True)
     if r.returncode:
         return None, "link: " + next((l for l in r.stderr.splitlines() if "undefined" in l or "multiple" in l), r.stderr[:160])
     code_addr, code = IMAGE["code"]
@@ -333,7 +361,7 @@ def run_native(exe, work, trials):
     with open(inp, "wb") as f:
         f.write(struct.pack("<3I", BASE, SIZE, len(trials)))
         for args, mem in trials:
-            f.write(struct.pack("<4I", *args) + mem)
+            f.write(struct.pack("<%dI" % NARGS, *args) + mem)
     r = subprocess.run([exe, inp, out, os.path.join(work, "image.bin")], capture_output=True, text=True, timeout=240)
     if r.returncode:
         raise RuntimeError("native runner: " + r.stderr[:200])
@@ -361,9 +389,16 @@ def main():
     ap.add_argument("--args")
     ap.add_argument("--source", help="test this file instead of the decomp's own source (a negative control)")
     ap.add_argument("--sample", type=int, default=0, help="with `all`: a random sample of that many sources")
+    ap.add_argument("--from", dest="from_addr", help="with `all`: start at this address (resume)")
+    ap.add_argument("--m64", action="store_true", help="native side compiled -m64 (a PIE; the game image is still mapped at its low addresses)")
+    ap.add_argument("--adapt", action="store_true", help="with --m64: adapt every compiled source (tools/u32_adapt.py) so pointer members are 32-bit")
     ap.add_argument("--shard", help="with `all`: I/N, the I-th of N interleaved parts (run N processes in parallel)")
     a = ap.parse_args()
     a.decomp = os.path.abspath(a.decomp)
+    global BITS, ADAPT
+    if a.m64 or a.adapt:
+        BITS = 64
+    ADAPT = a.adapt
     load_game(a.decomp)
     addrs = a.addrs
     if addrs == ["all"]:
@@ -377,6 +412,8 @@ def main():
         if a.shard:
             i, n = (int(x) for x in a.shard.split("/"))
             found = found[i::n]
+        if a.from_addr:
+            found = [f for f in found if int(f, 16) >= int(a.from_addr, 16)]
         if a.sample:
             random.Random(7).shuffle(found)
             found = found[:a.sample]
@@ -401,12 +438,15 @@ def main():
             print(f"{addr:08X}: skipped (64-bit or double return)", flush=True)
             tally("skipped: wide return")
             continue
-        exe, work = build_native(addr, src, ret[2])
+        try:
+            exe, work = build_native(addr, src, ret[2])
+        except subprocess.TimeoutExpired:
+            exe, work = None, "compile: timed out"
         if not exe:
             print(f"{addr:08X}: skipped ({work})", flush=True)
             tally("skipped: " + work.split(":")[0])
             continue
-        kinds = (a.args.split(",") + ["i"] * 4)[:4] if a.args else arg_kinds(src, addr)
+        kinds = (a.args.split(",") + ["i"] * NARGS)[:NARGS] if a.args else arg_kinds(src, addr)
         rng = random.Random(a.seed)
         src_text = open(src, encoding="utf-8", errors="replace").read()
         floaty = ret[0] == "f32" or "f" in kinds or bool(re.search(r"\b(f32|float)\b", src_text))
